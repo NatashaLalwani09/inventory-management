@@ -2,7 +2,30 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
+import uuid
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
+
+# In-memory restocking orders store
+restocking_orders = []
+
+# In-memory tasks store
+tasks_store = []
+
+# Default unit costs for demand forecast items not in inventory
+DEMAND_ITEM_COSTS = {
+    "WDG-001": 35.00,
+    "BRG-102": 45.00,
+    "GSK-203": 12.00,
+    "MTR-304": 280.00,
+    "FLT-405": 8.00,
+    "VLV-506": 95.00,
+    "SNR-420": 89.50,
+    "CTL-330": 65.00,
+}
+
+# Build a sku->unit_cost lookup from live inventory
+INVENTORY_COST_LOOKUP = {item["sku"]: item["unit_cost"] for item in inventory_items}
 
 app = FastAPI(title="Factory Inventory Management System")
 
@@ -303,6 +326,109 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking/items")
+def get_restocking_items():
+    """Return demand forecasts enriched with unit_cost for restocking planner."""
+    result = []
+    for forecast in demand_forecasts:
+        sku = forecast["item_sku"]
+        unit_cost = INVENTORY_COST_LOOKUP.get(sku) or DEMAND_ITEM_COSTS.get(sku, 50.00)
+        result.append({**forecast, "unit_cost": unit_cost})
+    return result
+
+
+class RestockingOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+    total_cost: float
+
+
+class RestockingOrder(BaseModel):
+    id: str
+    items: List[RestockingOrderItem]
+    total_cost: float
+    status: str
+    submitted_at: str
+    expected_delivery: str
+
+
+class CreateRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderItem]
+    total_cost: float
+
+
+@app.get("/api/restocking/orders", response_model=List[RestockingOrder])
+def get_restocking_orders():
+    return restocking_orders
+
+
+@app.post("/api/restocking/orders", response_model=RestockingOrder)
+def create_restocking_order(request: CreateRestockingOrderRequest):
+    now = datetime.now()
+    order = {
+        "id": f"RST-{str(uuid.uuid4())[:8].upper()}",
+        "items": [item.model_dump() for item in request.items],
+        "total_cost": round(request.total_cost, 2),
+        "status": "Submitted",
+        "submitted_at": now.isoformat(),
+        "expected_delivery": (now + timedelta(days=7)).isoformat(),
+    }
+    restocking_orders.append(order)
+    return order
+
+
+
+class Task(BaseModel):
+    id: str
+    title: str
+    priority: str
+    dueDate: str
+    status: str
+
+class CreateTaskRequest(BaseModel):
+    title: str
+    priority: str
+    dueDate: str
+
+
+@app.get("/api/tasks", response_model=List[Task])
+def get_tasks():
+    return tasks_store
+
+
+@app.post("/api/tasks", response_model=Task)
+def create_task(request: CreateTaskRequest):
+    task = {
+        "id": f"task-{str(uuid.uuid4())[:8]}",
+        "title": request.title,
+        "priority": request.priority,
+        "dueDate": request.dueDate,
+        "status": "pending",
+    }
+    tasks_store.append(task)
+    return task
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: str):
+    idx = next((i for i, t in enumerate(tasks_store) if t["id"] == task_id), None)
+    if idx is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    tasks_store.pop(idx)
+    return {"ok": True}
+
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def toggle_task(task_id: str):
+    task = next((t for t in tasks_store if t["id"] == task_id), None)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task["status"] = "completed" if task["status"] == "pending" else "pending"
+    return task
+
 
 if __name__ == "__main__":
     import uvicorn
